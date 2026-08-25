@@ -13,7 +13,11 @@ import pandas as pd
 import yaml
 
 from aiconfigurator import __version__
-from aiconfigurator.cli.estimate_detail_report import detail_requests_time, format_estimate_detail_report
+from aiconfigurator.cli.estimate_detail_report import (
+    detail_requests_time,
+    format_estimate_detail_report,
+    format_moe_comm_fallback,
+)
 from aiconfigurator.cli.report_and_save import log_final_summary, save_results
 from aiconfigurator.cli.utils import merge_experiment_results_by_mode, process_experiment_result
 from aiconfigurator.generator.api import (
@@ -26,16 +30,28 @@ from aiconfigurator.logging_utils import setup_logging
 from aiconfigurator.sdk import common, perf_database
 from aiconfigurator.sdk.config_builders import resolve_nextn_auto
 from aiconfigurator.sdk.errors import (
+    EmpiricalNotImplementedError,
     ExperimentOutcome,
+    MissingSystemFlopsError,
     NoFeasibleConfigError,
+    PerfDataNotAvailableError,
+    SolNotImplementedError,
     is_expected_cli_error,
 )
+from aiconfigurator.sdk.performance_result import MOE_COMM_FALLBACKS_COLUMN
 from aiconfigurator.sdk.rust_engine_step import validate_engine_step_backend
 from aiconfigurator.sdk.speculative import normalize_speculative_decoding
 from aiconfigurator.sdk.task_v2 import Task, _lookup_num_gpus_per_node, _warn_large_ep_flag
 from aiconfigurator.sdk.utils import ListFlowDumper, get_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
+
+_SOL_DETAIL_UNAVAILABLE_ERRORS = (
+    PerfDataNotAvailableError,
+    EmpiricalNotImplementedError,
+    MissingSystemFlopsError,
+    SolNotImplementedError,
+)
 
 
 def _latest_support_matrix_version(
@@ -2481,6 +2497,18 @@ def _print_per_ops_latency(per_ops_data: dict) -> None:
             _print_per_ops_section("AFD Transfer (per layer, a2f + f2a)", directional)
 
 
+def _apply_inclusive_tpot_to_row(row: dict, inclusive_tpot: bool, osl: int) -> dict:
+    """Apply inclusive TPOT transformation to row if requested.
+
+    Transforms TPOT for display: (ttft + tpot * (osl - 1)) / osl.
+    """
+    if inclusive_tpot and "tpot" in row and "ttft" in row:
+        from aiconfigurator.cli.report_and_save import get_inclusive_tpot
+
+        row["tpot"] = get_inclusive_tpot(row["ttft"], row["tpot"], osl)
+    return row
+
+
 def _run_estimate_epd(args, estimate_mode: str) -> None:
     """EPD single-point estimate via Task.run_single_* (dedicated encode pool)."""
     from aiconfigurator.cli.api import apply_row_power_coverage_gate
@@ -2595,13 +2623,8 @@ def _run_estimate_epd(args, estimate_mode: str) -> None:
             **encoder_kwargs,
         )
     row = apply_row_power_coverage_gate(row)
-
-    # Apply inclusive TPOT transformation if requested
-    if getattr(args, "inclusive_tpot", False) and "tpot" in row and "ttft" in row:
-        from aiconfigurator.cli.report_and_save import get_inclusive_tpot
-
-        row["tpot"] = get_inclusive_tpot(row["ttft"], row["tpot"], args.osl)
-
+    _warn_moe_comm_fallbacks(row)
+    row = _apply_inclusive_tpot_to_row(row, args.inclusive_tpot, args.osl)
     logger.info("EPD %s single-point estimate:", estimate_mode)
     keys = (
         "ttft",
@@ -2628,6 +2651,16 @@ def _run_estimate_epd(args, estimate_mode: str) -> None:
             logger.info("  %-16s unavailable (%.0f%% power-data coverage)", key, row.get("power_coverage", 0.0) * 100)
             continue
         logger.info("  %-16s %s", key, f"{value:.3f}" if isinstance(value, float) else value)
+
+
+def _warn_moe_comm_fallbacks(result) -> None:
+    """Warn when an estimate executed against substitute MoE topology data."""
+    fallbacks = result.get(MOE_COMM_FALLBACKS_COLUMN, ()) if isinstance(result, dict) else result.moe_comm_fallbacks
+    for fallback in fallbacks:
+        logger.warning(
+            "Estimated MoE communication latency used fallback silicon data: %s.",
+            format_moe_comm_fallback(fallback),
+        )
 
 
 def _run_estimate_mode(args):
@@ -2744,14 +2777,19 @@ def _run_estimate_mode(args):
         )
 
     result = cli_estimate(**estimate_kwargs)
+    _warn_moe_comm_fallbacks(result)
     sol_result = None
+    sol_detail_error = None
     if needs_sol_detail:
         if args.database_mode == common.DatabaseMode.SOL.name:
             sol_result = result
         else:
             sol_estimate_kwargs = dict(estimate_kwargs)
             sol_estimate_kwargs["database_mode"] = common.DatabaseMode.SOL.name
-            sol_result = cli_estimate(**sol_estimate_kwargs)
+            try:
+                sol_result = cli_estimate(**sol_estimate_kwargs)
+            except _SOL_DETAIL_UNAVAILABLE_ERRORS as exc:
+                sol_detail_error = str(exc)
 
     # Compute display TPOT (transformed if --inclusive-tpot is set)
     from aiconfigurator.cli.report_and_save import get_inclusive_tpot
@@ -2920,6 +2958,8 @@ def _run_estimate_mode(args):
             report = format_estimate_detail_report(result, sol_result, detail=detail_arg)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+        if sol_detail_error is not None:
+            report = f"SOL comparison unavailable: {sol_detail_error}\n\n{report}"
         if report:
             print("\n" + "-" * 60)
             print(f"  Detailed Breakdown ({detail_arg})")
